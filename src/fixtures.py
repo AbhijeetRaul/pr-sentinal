@@ -128,15 +128,27 @@ FIXTURES = [
             "headers set during one request persist into every later request that "
             "relies on the defaults."
         ),
+        # Widened after a real miss: the model wrote "DEFAULT_HEADERS is being
+        # mutated ... will retain the changes made in previous calls", which is
+        # a textbook description of the bug, and the scorer marked it MISS
+        # because it wanted the phrase "persist across". The list had been
+        # tightened to fix an earlier over-report and overshot.
         "signals": [
-            "object.assign(default_headers",
+            "default_headers is being mutated",
             "mutates default_headers",
+            "mutating default_headers",
+            "object.assign(default_headers",
             "mutates the shared",
             "modifies default_headers",
             "shared object",
             "module-level",
             "leak",
             "persist across",
+            "retain the changes",
+            "retains the changes",
+            "previous calls",
+            "across function calls",
+            "subsequent calls",
         ],
         "diff": """--- FILE: lib/core/mergeConfig.js (modified, +8/-2)
 @@ -1,12 +1,18 @@

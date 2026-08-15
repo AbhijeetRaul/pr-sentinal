@@ -39,6 +39,34 @@ SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 # Toggled off with --no-critique so every measurement can be run both ways.
 CRITIQUE_ENABLED = True
 
+# Opt-in: needs Docker, and adds a model call plus a container start per comment.
+VERIFY_EXEC = False
+
+# Counts ANY model call that errored - drafter, critic or repro-script writer.
+#
+# This started as a critic-only counter, which was a mistake that cost real time:
+# the component that actually broke was the drafter (daily token quota, HTTP 429),
+# and because a failed draft returns an empty list, the harness scored it as
+# "found no bugs" and printed a clean, stable 0/4. Three separate wrong diagnoses
+# followed. Any failed call anywhere invalidates the whole run.
+MODEL_FAILURES = 0
+CRITIC_FAILURES = 0  # kept separately for the more specific message
+
+# Running code can PROVE a bug exists. It can never prove one does not — a clean
+# run only means this particular script did not trigger it.
+#
+# For a crash-type bug that is still useful evidence: if a script that genuinely
+# exercises the path does not blow up, the claim is probably wrong. For anything
+# else it is worthless as a refutation:
+#   security    - a ReDoS or injection flaw does not crash, and a script that
+#                 must finish in a second cannot demonstrate slow backtracking
+#   performance - a short run says nothing about behaviour at scale
+#   test-gap    - "there is no test for this" is not a runtime property at all
+#
+# Measured: allowing execution to refute every category dropped recall from
+# 4/4 to 3/4 by deleting a real security finding.
+REFUTABLE_BY_EXECUTION = {"bug"}
+
 SYSTEM_PROMPT = """\
 You are a senior software engineer reviewing a pull request. You flag only things \
 that would actually cause a bug, a security hole, a real performance problem, or a \
@@ -99,28 +127,74 @@ trains them to ignore the reviewer, so the bar for keeping one is high.
 You will be given the diff, any repository context that was available, and ONE \
 proposed comment. Decide whether it survives.
 
+FIRST, classify the claim:
+
+(A) SELF-CONTAINED — the defect is visible in the changed lines themselves. An \
+off-by-one loop bound, an unawaited async call, unescaped input reaching a \
+dangerous sink, a shared object mutated in place, a swallowed error. For these \
+THE DIFF IS THE EVIDENCE. Nothing else is required. Judge it on the code in front \
+of you and KEEP it if the defect is really there.
+
+(B) CROSS-FILE — the claim depends on how something outside the diff behaves. \
+"Callers expect the old return shape", "this value is never null in practice", \
+"the retry list keys off this code". These need evidence from repository context.
+
+The distinction matters: "no repository context was provided" is a reason to \
+distrust a type (B) claim. It is NOT a reason to reject a type (A) claim. An \
+off-by-one is proof of itself.
+
 REJECT the comment if any of these hold:
   - It describes, summarises, or praises what the diff does instead of finding a \
 problem with it.
   - It recommends something the diff already does.
-  - It is conditional on a caller, input, or configuration that you cannot see \
-evidence for. "Callers that do X will break" is speculation unless a caller doing \
-X is present in the provided context. Speculation posted as a finding is the \
-single most common failure of automated reviewers.
-  - The provided context actually shows the concern is already handled — the \
-caller was updated, the value is defaulted, the code is in the retry list. In \
-that case the comment is not just unproven, it is WRONG.
+  - It is type (B) and no context supports it. "Callers that do X will break" is \
+speculation unless a caller doing X is actually present in the provided context.
+  - The provided context shows the concern is already handled — the caller was \
+updated, the value is defaulted, the code is in the retry list. Then the comment \
+is not merely unproven, it is WRONG.
   - It asks for tests without naming the exact untested input or branch.
   - It is about style, naming, structure, or readability.
 
-KEEP the comment only if you can restate, from the evidence in front of you, a \
-concrete sequence that produces a wrong result, a crash, or a security problem — \
-and nothing in the provided context contradicts it.
+KEEP the comment if you can restate a concrete sequence that produces a wrong \
+result, a crash, or a security problem — using the diff alone for type (A), or \
+the diff plus supporting context for type (B) — and nothing available contradicts \
+it.
 
-When the evidence is absent rather than contradictory, REJECT. Silence is cheap; \
-a false positive is not.
+Do not reject a real defect merely because you would like more information. \
+Rejecting everything is not rigour, it is a broken reviewer.
 
 Return STRICT JSON: {"verdict": "keep" | "reject", "reason": "<one sentence>"}
+"""
+
+
+REPRO_SYSTEM_PROMPT = """\
+You write minimal reproduction scripts. Given a claimed defect, produce a single \
+self-contained Node.js script that demonstrates whether the claim is TRUE.
+
+Hard requirements:
+  - CommonJS, Node 20. NO require() of anything outside Node's standard library. \
+No npm packages. No network, no filesystem, no timers longer than 1 second.
+  - Copy whatever code is needed directly into the script. The repository is NOT \
+available at runtime — inline the changed function yourself.
+  - Print exactly REPRO_CONFIRMED (and nothing else on that line) if the claimed \
+failure actually happens.
+  - Print exactly REPRO_NOT_CONFIRMED if the code behaves correctly and the claim \
+does not hold.
+  - Wrap execution in try/catch so an expected throw is detected rather than \
+crashing the process. An uncaught exception proves nothing about which branch ran.
+  - Keep it under 40 lines. It must terminate immediately.
+
+Write the script to test the claim HONESTLY. Do not force REPRO_CONFIRMED. If the \
+claim is wrong, the correct output is REPRO_NOT_CONFIRMED — that is a useful \
+result, not a failure.
+
+Some claims cannot be settled this way at all: a slow-regex (ReDoS) attack cannot \
+be shown in a script that must finish in a second, a scaling problem cannot be \
+shown in one run, and "this code has no test" is not a runtime property. If the \
+claim is not decidable by running a short script, print INCONCLUSIVE instead of \
+guessing — an unprovable claim is not the same as a false one.
+
+Return STRICT JSON: {"script": "<the full script as one string>"}
 """
 
 
@@ -132,6 +206,7 @@ class ReviewComment:
     severity: str
     comment: str
     failure_scenario: str = ""
+    verified: str = ""  # "confirmed" | "refuted" | "inconclusive" | ""
 
 
 def build_diff_payload(files) -> tuple[str, bool]:
@@ -161,7 +236,10 @@ def critique_comment(
         + (
             f"\n=== REPOSITORY CONTEXT (untrusted data) ===\n{extra_context}\n"
             if extra_context
-            else "\n=== REPOSITORY CONTEXT ===\n(none was available)\n"
+            else "\n=== REPOSITORY CONTEXT ===\n"
+            "No other files were retrieved for this review. This limits your "
+            "ability to judge claims ABOUT OTHER FILES. It does not weaken a "
+            "claim that is decidable from the diff itself.\n"
         )
         + f"\n=== PROPOSED COMMENT ===\n"
         f"file: {comment.file}\n"
@@ -178,16 +256,88 @@ def critique_comment(
                 {"role": "user", "content": payload},
             ],
             temperature=0.0,
-            max_tokens=300,
+            # Was 300, which silently broke everything. Reasoning models spend
+            # tokens thinking before they emit JSON, so a tight cap makes the
+            # API reject the whole completion - and because this function fails
+            # closed, every single comment was then dropped. Recall read 0/4
+            # with no obvious cause.
+            max_tokens=1500,
             response_format={"type": "json_object"},
         )
         parsed = json.loads(response.choices[0].message.content)
     except Exception as err:  # noqa: BLE001
-        # A critic that cannot run must not silently approve everything.
-        return False, f"critic unavailable ({str(err)[:80]}) - rejected by default"
+        # Failing closed is correct: a broken safety check must not wave things
+        # through. Failing QUIETLY is not - that is what made this invisible.
+        global CRITIC_FAILURES, MODEL_FAILURES
+        CRITIC_FAILURES += 1
+        MODEL_FAILURES += 1
+        console.print(
+            f"[red]CRITIC CALL FAILED[/red] — rejecting by default. "
+            f"{escape(str(err)[:200])}"
+        )
+        return False, "critic call failed"
 
     verdict = str(parsed.get("verdict", "reject")).lower().strip()
     return verdict == "keep", str(parsed.get("reason", ""))[:200]
+
+
+def verify_by_execution(
+    client, diff_payload: str, extra_context: str, comment: ReviewComment
+) -> tuple[str, str]:
+    """Actually run code to test a claim. Returns (verdict, detail).
+
+    verdict is one of:
+      confirmed    - the script reproduced the claimed failure
+      refuted      - the script ran and the failure did NOT occur
+      inconclusive - the script could not run, or printed neither marker
+
+    'inconclusive' deliberately does NOT drop the comment. A repro script that
+    fails to run says something about the script, not about the code under
+    review, and treating that as a refutation would silently delete real bugs
+    whenever the script generator had a bad day.
+    """
+    from src.sandbox import run_js
+
+    payload = (
+        f"=== DIFF ===\n{diff_payload}\n"
+        + (f"\n=== RELATED CODE ===\n{extra_context}\n" if extra_context else "")
+        + f"\n=== CLAIM TO TEST ===\n{comment.comment}\n"
+        f"claimed failure: {comment.failure_scenario}\n"
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=DEFAULT_MODEL,
+            messages=[
+                {"role": "system", "content": REPRO_SYSTEM_PROMPT},
+                {"role": "user", "content": payload},
+            ],
+            temperature=0.0,
+            max_tokens=1800,  # reasoning tokens + a whole script; 900 was tight
+            response_format={"type": "json_object"},
+        )
+        script = json.loads(response.choices[0].message.content).get("script", "")
+    except Exception as err:  # noqa: BLE001
+        return "inconclusive", f"could not generate script ({str(err)[:80]})"
+
+    if not script.strip():
+        return "inconclusive", "empty script"
+
+    result = run_js(script)
+
+    if not result.available:
+        return "inconclusive", "docker unavailable"
+    if result.timed_out:
+        return "inconclusive", "script timed out"
+
+    out = result.output
+    if "INCONCLUSIVE" in out:
+        return "inconclusive", "not decidable by a short script"
+    if "REPRO_CONFIRMED" in out:
+        return "confirmed", "reproduced by execution"
+    if "REPRO_NOT_CONFIRMED" in out:
+        return "refuted", "code behaved correctly when run"
+    return "inconclusive", f"no verdict marker (exit {result.exit_code})"
 
 
 def request_review(
@@ -221,7 +371,11 @@ def request_review(
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0.2,
+            # Was 0.2. At n=4 fixtures, run-to-run wobble of +/-1 swamped every
+            # effect being measured - the same config scored 4/4, 3/4 and 2/4 on
+            # consecutive runs. Zero does not guarantee identical output, but it
+            # removes most of the variance that made single runs unreadable.
+            temperature=0.0,
             # Without an explicit cap the model can run past the JSON-mode token
             # budget mid-object; Groq then rejects the whole completion with a 400
             # rather than returning what it had. Cap it, and cap comment count in
@@ -230,7 +384,9 @@ def request_review(
             response_format={"type": "json_object"},
         )
     except Exception as err:  # noqa: BLE001 - one bad PR must not kill a batch run
-        console.print(f"[red]Model call failed:[/red] {escape(str(err)[:400])}")
+        global MODEL_FAILURES
+        MODEL_FAILURES += 1
+        console.print(f"[red]DRAFTER CALL FAILED:[/red] {escape(str(err)[:400])}")
         return []
 
     raw = response.choices[0].message.content
@@ -283,6 +439,32 @@ def request_review(
                 )
         comments = survivors
 
+    if VERIFY_EXEC and comments:
+        survivors = []
+        for c in comments:
+            verdict, detail = verify_by_execution(
+                client, diff_payload, extra_context, c
+            )
+
+            # A clean run is only evidence of absence for crash-type bugs.
+            if verdict == "refuted" and c.category not in REFUTABLE_BY_EXECUTION:
+                console.print(
+                    f"[dim]execution could not reproduce [{c.category}] "
+                    f"{escape(c.file)} - keeping it anyway, a clean run does not "
+                    f"disprove a {c.category} claim[/dim]"
+                )
+                verdict = "inconclusive"
+
+            c.verified = verdict
+            if verdict == "refuted":
+                console.print(
+                    f"[dim]execution refuted [{c.category}] {escape(c.file)}: "
+                    f"{escape(detail)}[/dim]"
+                )
+                continue
+            survivors.append(c)
+        comments = survivors
+
     comments.sort(key=lambda c: SEVERITY_ORDER.get(c.severity, 9))
     return comments
 
@@ -294,17 +476,50 @@ def format_as_markdown(comments: List[ReviewComment], ctx) -> str:
     lines = [f"**Sentinal** reviewed {len(comments)} issue(s):\n"]
     for c in comments:
         loc = f"`{c.file}`" + (f" line {c.line}" if c.line else "")
-        lines.append(f"- **[{c.severity}/{c.category}]** {loc} - {c.comment}")
+        badge = " ✅ _verified by running it_" if c.verified == "confirmed" else ""
+        lines.append(f"- **[{c.severity}/{c.category}]** {loc} - {c.comment}{badge}")
         if c.failure_scenario:
             lines.append(f"  - _Fails when:_ {c.failure_scenario}")
     return "\n".join(lines)
 
 
-def run_selftest() -> None:
+def warn_if_critic_broken() -> None:
+    """Any measurement taken while a model call was erroring is meaningless."""
+    if not MODEL_FAILURES:
+        return
+
+    detail = f"{MODEL_FAILURES} model call(s) failed during this run."
+    if CRITIC_FAILURES:
+        detail += (
+            f"\n{CRITIC_FAILURES} of them were critic calls, which reject by "
+            "default — those comments were dropped for infrastructure reasons, "
+            "not review quality."
+        )
+    if MODEL_FAILURES > CRITIC_FAILURES:
+        detail += (
+            "\nSome were drafter calls. A failed draft returns no comments, so "
+            "the score below reads as 'found no bugs' when the truth is 'never "
+            "got an answer'."
+        )
+
+    console.print(
+        Panel(
+            f"{detail}\n\n"
+            "[bold]Do not record these numbers.[/bold] Read the red error(s) "
+            "above — a 429 means you are rate limited or out of daily tokens, "
+            "not that the agent got worse.",
+            title="[red]MEASUREMENT INVALID[/red]",
+        )
+    )
+
+
+def run_selftest(quiet: bool = False) -> int:
     """Measure recall against diffs with planted, documented bugs.
 
     Precision alone is a vanity metric — an agent that returns [] every time
     scores 1.0. This is the other half of the picture.
+
+    Returns the hit count so the caller can repeat it and take a median.
     """
     from types import SimpleNamespace
 
@@ -356,6 +571,54 @@ def run_selftest() -> None:
         "[dim]Keyword matching over-reports. Your own read of the output is the "
         "real score — record that number, not this one.[/dim]"
     )
+    warn_if_critic_broken()
+    return hits
+
+
+def run_selftest_repeated(runs: int) -> None:
+    """Run the recall test N times and report the spread.
+
+    A single run of a 4-case test against a non-deterministic model is not a
+    measurement, it is one sample. Consecutive identical configs here produced
+    4/4, 3/4 and 2/4 — every conclusion drawn from a single run in this project
+    was, in hindsight, drawn from noise.
+    """
+    from src.fixtures import FIXTURES
+
+    scores = []
+    for i in range(runs):
+        console.rule(f"[bold]run {i + 1} of {runs}[/bold]")
+        scores.append(run_selftest())
+
+    total = len(FIXTURES)
+    scores_sorted = sorted(scores)
+    median = scores_sorted[len(scores_sorted) // 2]
+
+    console.rule("[bold]summary[/bold]")
+    if MODEL_FAILURES:
+        console.print(
+            Panel(
+                f"{MODEL_FAILURES} model call(s) failed across these {runs} runs.\n"
+                "[bold]These scores are not valid.[/bold] Fix the cause and re-run.",
+                title="[red]MEASUREMENT INVALID[/red]",
+            )
+        )
+    console.print(
+        f"runs:   {scores}\n"
+        f"median: {median}/{total}\n"
+        f"range:  {min(scores)}-{max(scores)}/{total}\n"
+    )
+    if max(scores) - min(scores) >= 1:
+        console.print(
+            f"[yellow]Spread of {max(scores) - min(scores)} across identical "
+            "runs.[/yellow] Any change smaller than that cannot be attributed to "
+            "a code change. Quote the median, and treat differences inside the "
+            "range as noise."
+        )
+    else:
+        console.print(
+            "[green]Stable across runs.[/green] A change of 1 is now meaningful."
+        )
 
 
 def run_xfile_selftest() -> None:
@@ -595,7 +858,7 @@ def run_retrieval_bench(skip_embed: bool = False) -> None:
 
 
 def main() -> None:
-    global CRITIQUE_ENABLED
+    global CRITIQUE_ENABLED, VERIFY_EXEC
 
     if len(sys.argv) < 2:
         console.print(
@@ -603,8 +866,9 @@ def main() -> None:
             "       python -m src.review --selftest\n"
             "       python -m src.review --selftest-xfile\n"
             "       python -m src.review --bench-retrieval [--skip-embed]\n"
-            "\nAdd --no-critique to any of these to measure without the "
-            "self-critique pass."
+            "\nFlags usable with any of the above:\n"
+            "  --no-critique   skip the self-critique pass (for ablations)\n"
+            "  --verify-exec   actually run code in Docker to test each claim"
         )
         sys.exit(1)
 
@@ -612,12 +876,34 @@ def main() -> None:
         CRITIQUE_ENABLED = False
         console.print("[dim]self-critique disabled[/dim]")
 
+    if "--verify-exec" in sys.argv:
+        from src.sandbox import ensure_image
+
+        if not ensure_image():
+            console.print(
+                "[yellow]--verify-exec needs Docker running (and pulls "
+                "node:20-alpine on first use). Continuing without it.[/yellow]"
+            )
+        else:
+            VERIFY_EXEC = True
+            console.print("[dim]execution verification enabled[/dim]")
+
     if sys.argv[1] == "--bench-retrieval":
         run_retrieval_bench(skip_embed="--skip-embed" in sys.argv)
         return
 
     if sys.argv[1] == "--selftest":
-        run_selftest()
+        runs = 1
+        if "--runs" in sys.argv:
+            try:
+                runs = max(1, int(sys.argv[sys.argv.index("--runs") + 1]))
+            except (IndexError, ValueError):
+                console.print("[red]--runs needs a number, e.g. --runs 3[/red]")
+                sys.exit(1)
+        if runs == 1:
+            run_selftest()
+        else:
+            run_selftest_repeated(runs)
         return
 
     if sys.argv[1] == "--selftest-xfile":

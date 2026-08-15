@@ -8,9 +8,39 @@ scorer's — it has over-reported twice and both cases are recorded.
 **Detection** — `--selftest` (self-contained bugs) and `--selftest-xfile`
 (cross-file bugs) against diffs with planted, documented defects.
 
+The automatic scorer matches keywords and **has failed in both directions**: it
+once scored a HIT because an unrelated comment contained the word "promise",
+and later scored a MISS on a textbook-correct description of a shared-mutation
+bug because the model wrote "retain the changes" instead of "persist across".
+Both were caught by reading output the number said was fine. Treat it as a
+convenience only; the recorded score is always the one verified by reading.
+
 **False positives** — merged, cleanly-reviewed PRs from `axios/axios`, plus
 "safe" fixtures: identical diffs where context proves nothing is broken and the
 correct output is zero comments.
+
+---
+
+## ⚠️ Validity note — read before trusting any number here
+
+A long stretch of results in this project were measured while the Groq daily
+token quota was draining and then exhausted (HTTP 429). A failed model call
+returned no comments, and the harness scored that as "found no bugs" — so an
+outage was indistinguishable from a bad reviewer. Scores degraded 4/4 → 3/4 →
+2/4 → 0/4 and were diagnosed, wrongly and repeatedly, as temperature noise, an
+over-aggressive critic, and an over-eager execution check.
+
+Fixed: every model call now increments a failure counter and any run with a
+non-zero count prints MEASUREMENT INVALID and must be discarded.
+
+Status of the numbers below:
+- **Valid** — anything explicitly re-run after the fix, on a quiet banner.
+- **Suspect** — the mid-session 3/4 and 2/4 recall figures.
+- **Invalid** — every 0/4. Those were an outage, not a result.
+
+The retrieval comparison (4 → 2 → 2 false alarms) was taken early, well below
+the quota ceiling, and is most likely sound — but it should be re-run once on
+fresh quota before being quoted anywhere.
 
 ---
 
@@ -22,8 +52,20 @@ correct output is zero comments.
 | 2 | Rubric rewrite; `failure_scenario` required and enforced in code | llama-3.3-70b | 1/4 | 0 | Precision fixed. Heuristic scorer claimed 2/4 — it matched the word "promise" in an unrelated comment |
 | 3 | Scoring signals tightened, token cap added | llama-3.3-70b | 2/4 | 0 | Honest baseline |
 | 4 | Model swap only, prompt unchanged | gpt-oss-120b | 4/4 | 0 | Capability, not prompting |
+| 5 | Critic fix (self-contained vs cross-file claims) + critic token cap 300→1500 | llama-3.3-70b | **3/4 (verified by reading)** | — | First run after the quota fix, banner quiet. Scorer said 2/4; fixture 4 was a genuine hit it failed to match |
 
 Controlled: #3 → #4 changed one variable. Recall 50% → 100%, precision held.
+
+Row 5 is on the *weaker* model (quota exhausted on gpt-oss-120b), so 3/4 is not
+comparable to row 4's 4/4. The one genuine miss — the unawaited async call — is
+the same class llama-3.3-70b missed in row 3, which is consistent: it is a model
+capability gap, not a pipeline regression.
+
+Two things row 5 does establish, both previously unknown:
+- The critic works. It kept three real findings and dropped nothing valid. Every
+  earlier 0/4 was the outage, not the critic.
+- The critic prompt fix matters: it now separates claims provable from the diff
+  alone (an off-by-one is proof of itself) from claims that need other files.
 
 ---
 
