@@ -74,11 +74,43 @@ Lexical ranking structurally cannot win that case — it is the one place
 embeddings could plausibly beat it, and it is why the comparison is still worth
 finishing.
 
+---
+
+## Self-critique ablation (Phase 5)
+
+An independent critic call per drafted comment, told that absent evidence means
+reject. Same fixtures, one variable changed.
+
+| | detection (diff only) | FP (diff only) | detection (with context) | FP (with context) |
+|---|---|---|---|---|
+| no critique | 3/3 | 3–4 | 3/3 | 2 |
+| **with critique** | 2/3 | 2 | **3/3** | **0** |
+
+**These two phases are not independent — retrieval supplies the evidence the
+critic demands.**
+
+- Retrieval alone: still 2 false positives.
+- Critique alone: costs a real finding (3/3 → 2/3), because blind cross-file
+  findings were speculation that happened to be right. The critic rejects
+  unevidenced claims and cannot tell a lucky guess from a wrong one — correctly.
+- Together: 3/3 detection, 0 false positives.
+
+The blind-plus-critic row is the most informative cell in this whole document.
+It shows the cost of demanding rigour without supplying information, and it is
+why "add a self-critique step" is not a free improvement.
+
 ### Caveats, stated plainly
 - 3 cross-file fixtures, 6 retrieval trials. Small.
 - Fixtures are synthetic and written by the same person who tuned the retriever.
 - Embedding retriever is implemented but unmeasured (needs `OPENAI_API_KEY`).
   No claim about lexical-vs-semantic is warranted until it runs.
+- **Run-to-run variance is real.** The no-critique blind FP count came out 4 on
+  one run and 3 on the next with nothing changed — the drafter runs at
+  `temperature=0.2`. Single runs at n=3 cannot separate a 1-point difference
+  from noise. Every number quoted as final should be the median of 3 runs, or
+  the drafter should be pinned to `temperature=0.0` and the figures regenerated.
+  Differences of 2+ (4→2, 2→0) are outside the observed noise band; a 1-point
+  move is not.
 
 ---
 
@@ -105,6 +137,9 @@ overturned the obvious answer:
 3. Retrieval was justified for the wrong reason. It does not find more bugs; it
    stops the agent from crying wolf — and the cheap lexical version matched
    perfect context, so the planned vector database was not built.
+4. Self-critique is not a free win. Added alone it *cost* a real finding. It only
+   pays off once retrieval supplies the evidence it demands — 3/3 detection with
+   0 false positives, where each component alone plateaus.
 
 "I measured before building, and the measurement said don't build it" is a
 stronger engineering signal than any architecture diagram.

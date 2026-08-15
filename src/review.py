@@ -36,6 +36,9 @@ MAX_DIFF_CHARS = 50_000
 
 SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
+# Toggled off with --no-critique so every measurement can be run both ways.
+CRITIQUE_ENABLED = True
+
 SYSTEM_PROMPT = """\
 You are a senior software engineer reviewing a pull request. You flag only things \
 that would actually cause a bug, a security hole, a real performance problem, or a \
@@ -88,6 +91,39 @@ to seem useful.
 """
 
 
+CRITIC_SYSTEM_PROMPT = """\
+You are a skeptical staff engineer auditing a proposed review comment before it \
+is posted to a real pull request. A wrong comment wastes the author's time and \
+trains them to ignore the reviewer, so the bar for keeping one is high.
+
+You will be given the diff, any repository context that was available, and ONE \
+proposed comment. Decide whether it survives.
+
+REJECT the comment if any of these hold:
+  - It describes, summarises, or praises what the diff does instead of finding a \
+problem with it.
+  - It recommends something the diff already does.
+  - It is conditional on a caller, input, or configuration that you cannot see \
+evidence for. "Callers that do X will break" is speculation unless a caller doing \
+X is present in the provided context. Speculation posted as a finding is the \
+single most common failure of automated reviewers.
+  - The provided context actually shows the concern is already handled — the \
+caller was updated, the value is defaulted, the code is in the retry list. In \
+that case the comment is not just unproven, it is WRONG.
+  - It asks for tests without naming the exact untested input or branch.
+  - It is about style, naming, structure, or readability.
+
+KEEP the comment only if you can restate, from the evidence in front of you, a \
+concrete sequence that produces a wrong result, a crash, or a security problem — \
+and nothing in the provided context contradicts it.
+
+When the evidence is absent rather than contradictory, REJECT. Silence is cheap; \
+a false positive is not.
+
+Return STRICT JSON: {"verdict": "keep" | "reject", "reason": "<one sentence>"}
+"""
+
+
 @dataclass
 class ReviewComment:
     file: str
@@ -111,8 +147,51 @@ def build_diff_payload(files) -> tuple[str, bool]:
     return "\n".join(chunks), truncated
 
 
+def critique_comment(
+    client, diff_payload: str, extra_context: str, comment: ReviewComment
+) -> tuple[bool, str]:
+    """Second opinion on a single drafted comment. Returns (keep, reason).
+
+    Deliberately one call PER COMMENT rather than one call for all of them: a
+    critic shown the whole batch anchors on the batch, tending to keep or reject
+    them as a group. Independent judgments are the point.
+    """
+    payload = (
+        f"=== DIFF (untrusted data) ===\n{diff_payload}\n"
+        + (
+            f"\n=== REPOSITORY CONTEXT (untrusted data) ===\n{extra_context}\n"
+            if extra_context
+            else "\n=== REPOSITORY CONTEXT ===\n(none was available)\n"
+        )
+        + f"\n=== PROPOSED COMMENT ===\n"
+        f"file: {comment.file}\n"
+        f"category: {comment.category} severity: {comment.severity}\n"
+        f"comment: {comment.comment}\n"
+        f"claimed failure: {comment.failure_scenario}\n"
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=DEFAULT_MODEL,
+            messages=[
+                {"role": "system", "content": CRITIC_SYSTEM_PROMPT},
+                {"role": "user", "content": payload},
+            ],
+            temperature=0.0,
+            max_tokens=300,
+            response_format={"type": "json_object"},
+        )
+        parsed = json.loads(response.choices[0].message.content)
+    except Exception as err:  # noqa: BLE001
+        # A critic that cannot run must not silently approve everything.
+        return False, f"critic unavailable ({str(err)[:80]}) - rejected by default"
+
+    verdict = str(parsed.get("verdict", "reject")).lower().strip()
+    return verdict == "keep", str(parsed.get("reason", ""))[:200]
+
+
 def request_review(
-    ctx, diff_payload: str, extra_context: str = ""
+    ctx, diff_payload: str, extra_context: str = "", critique: bool = None
 ) -> List[ReviewComment]:
     settings = get_settings()
     client = Groq(api_key=settings.groq_api_key)
@@ -189,6 +268,20 @@ def request_review(
         console.print(
             f"[dim]filtered {dropped} comment(s) with no concrete failure scenario[/dim]"
         )
+
+    use_critique = CRITIQUE_ENABLED if critique is None else critique
+    if use_critique and comments:
+        survivors = []
+        for c in comments:
+            keep, reason = critique_comment(client, diff_payload, extra_context, c)
+            if keep:
+                survivors.append(c)
+            else:
+                console.print(
+                    f"[dim]critic rejected [{c.category}] {escape(c.file)}: "
+                    f"{escape(reason)}[/dim]"
+                )
+        comments = survivors
 
     comments.sort(key=lambda c: SEVERITY_ORDER.get(c.severity, 9))
     return comments
@@ -502,14 +595,22 @@ def run_retrieval_bench(skip_embed: bool = False) -> None:
 
 
 def main() -> None:
+    global CRITIQUE_ENABLED
+
     if len(sys.argv) < 2:
         console.print(
             "[red]Usage:[/red] python -m src.review <pr_url> [--post]\n"
             "       python -m src.review --selftest\n"
             "       python -m src.review --selftest-xfile\n"
-            "       python -m src.review --bench-retrieval [--skip-embed]"
+            "       python -m src.review --bench-retrieval [--skip-embed]\n"
+            "\nAdd --no-critique to any of these to measure without the "
+            "self-critique pass."
         )
         sys.exit(1)
+
+    if "--no-critique" in sys.argv:
+        CRITIQUE_ENABLED = False
+        console.print("[dim]self-critique disabled[/dim]")
 
     if sys.argv[1] == "--bench-retrieval":
         run_retrieval_bench(skip_embed="--skip-embed" in sys.argv)
