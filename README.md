@@ -96,9 +96,29 @@ agent's comment contained certain words. For a missing-`await` bug it looked for
 a completely different issue. A miss got scored as a hit. Caught by reading the
 output that the score said was fine.
 
-**Results move between runs.** The same test gave 4 false alarms once and 3 the
-next time with nothing changed. Differences of 1 are noise here; only larger
-gaps (4→2, 2→0) are real.
+**The scoring script was wrong in the other direction too.** After tightening it,
+it marked a correct finding as a miss: the agent said a shared object "will
+retain the changes made in previous calls" — a textbook description of the bug —
+and the checker was looking for the phrase "persist across". Over-reporting, then
+under-reporting. There is no version of keyword matching that is actually
+reliable, so the recorded score is always the one read by eye.
+
+**An outage looked exactly like a bad reviewer.** Scores fell from 4/4 to 3/4 to
+2/4 to a flat 0/4. I explained each drop — random variation, then an
+over-strict critic, then an over-eager verification step — and changed code to
+fix all three. The real cause was the daily API token limit. Every call was
+failing, a failed call returned no comments, and "no comments" was scored as
+"found no bugs".
+
+That is a design flaw, not bad luck. The failure path returned the same thing as
+a clean run. Now every failed call is counted and any run containing one prints
+**MEASUREMENT INVALID** and refuses to be recorded.
+
+The related lesson is about the critique step, which rejects comments when it
+errors — the right choice, since a safety check that waves everything through
+when broken is worse than none. But it did that *quietly*. So a total outage was
+indistinguishable from a strict reviewer doing its job, and produced a clean,
+stable, completely meaningless zero. **Fail closed, but fail loudly.**
 
 ## Running it
 
@@ -133,6 +153,9 @@ is worse than no check, because nothing in the output would tell you.
 - Test cases are synthetic and written by the same person who tuned the agent.
 - Embedding search is built but not yet measured.
 - Only tested end-to-end on `axios/axios`.
-- Numbers should be medians of several runs; currently mostly single runs.
+- False-alarm rate on real pull requests is based on a single PR.
+- Some figures in [`EVAL.md`](./EVAL.md) were taken during the API outage
+  described above and are marked there as invalid or unconfirmed pending a
+  re-run. They are flagged rather than quietly removed.
 
 Full experiment log: [`EVAL.md`](./EVAL.md)
