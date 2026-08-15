@@ -1,0 +1,10 @@
+# --- Phase 1-2 (install now) ---
+PyGithub==2.4.0
+python-dotenv==1.0.1
+groq==0.11.0
+rich==13.9.2
+
+# --- Phase 3+ (install later, when you get there) ---
+# psycopg[binary]==3.2.3      # NOT psycopg2-binary: no wheels for Python 3.14
+# pgvector==0.3.4
+# openai==1.51.0              # embeddings only
