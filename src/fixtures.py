@@ -170,3 +170,174 @@ FIXTURES = [
 """,
     },
 ]
+
+
+# ---------------------------------------------------------------------------
+# Round 2: bug classes the first four did not cover.
+#
+# The original set was one arithmetic slip, one async slip, one injection and
+# one shared-state slip. Real defects also hide in error handling, cleanup,
+# authorisation and concurrency, and an agent can be good at one family and
+# blind to another. Signals here list several phrasings on purpose - the
+# scorer has already produced both a false hit and a false miss by being too
+# loose and then too strict.
+# ---------------------------------------------------------------------------
+
+FIXTURES += [
+    {
+        "name": "error swallowed, corrupt result returned as success",
+        "file": "lib/core/loadProfile.js",
+        "expect": (
+            "The catch block logs and returns `partial`, so a failed fetch is "
+            "indistinguishable from a successful one. Callers receive an object "
+            "missing its permissions and treat it as valid."
+        ),
+        "signals": [
+            "swallow", "swallowed", "silently", "silent",
+            "returns partial", "partial data", "incomplete",
+            "treated as success", "looks like a success",
+            "caller cannot tell", "callers cannot tell",
+            "hides the error", "hiding the failure", "masks the error",
+            "empty permissions", "missing permissions",
+        ],
+        "diff": """--- FILE: lib/core/loadProfile.js (modified, +12/-3)
+@@ -1,14 +1,23 @@
+ async function loadProfile(userId) {
+   const partial = { id: userId, name: null, permissions: [] };
+
+-  const user = await api.getUser(userId);
+-  const perms = await api.getPermissions(userId);
+-  return { ...partial, name: user.name, permissions: perms };
++  try {
++    const user = await api.getUser(userId);
++    partial.name = user.name;
++
++    const perms = await api.getPermissions(userId);
++    partial.permissions = perms;
++  } catch (err) {
++    logger.warn('profile load failed', err);
++  }
++
++  return partial;
+ }
+
+ module.exports = loadProfile;
+""",
+    },
+    {
+        "name": "interval never cleared on the error path",
+        "file": "lib/core/pollJob.js",
+        "expect": (
+            "clearInterval only runs on the success path. If the job errors, the "
+            "interval keeps firing forever, holding the callback and its closure "
+            "alive - a leak that grows with every failed job."
+        ),
+        "signals": [
+            "clearinterval", "clear interval", "never cleared", "not cleared",
+            "leak", "leaks", "keeps running", "keeps firing", "runs forever",
+            "error path", "on failure", "if it throws", "when it rejects",
+            "finally",
+        ],
+        "diff": """--- FILE: lib/core/pollJob.js (modified, +16/-4)
+@@ -1,12 +1,26 @@
+ function pollJob(jobId, onDone) {
+-  return api.getJob(jobId).then(onDone);
++  const timer = setInterval(async () => {
++    const job = await api.getJob(jobId);
++
++    if (job.status === 'running') {
++      return;
++    }
++
++    if (job.status === 'failed') {
++      onDone(new Error(`job ${jobId} failed`));
++      return;
++    }
++
++    clearInterval(timer);
++    onDone(null, job);
++  }, 1000);
++
++  return timer;
+ }
+
+ module.exports = pollJob;
+""",
+    },
+    {
+        "name": "ownership checked against the wrong id",
+        "file": "lib/routes/documents.js",
+        "expect": (
+            "The handler verifies the requester owns `req.params.id`, then loads "
+            "and returns `req.query.docId` instead. Any authenticated user can "
+            "read any document by passing an id they own plus someone else's "
+            "docId."
+        ),
+        "signals": [
+            "wrong id", "different id", "params.id", "query.docid",
+            "checks one", "checked against", "mismatch",
+            "any user", "another user", "other users",
+            "idor", "authorization", "authorisation", "access control",
+            "bypass", "not the document being returned",
+        ],
+        "diff": """--- FILE: lib/routes/documents.js (modified, +11/-2)
+@@ -1,13 +1,22 @@
+ router.get('/documents/:id', requireAuth, async (req, res) => {
+-  const doc = await Document.findById(req.params.id);
+-
+-  if (doc.ownerId !== req.user.id) {
+-    return res.status(403).json({ error: 'forbidden' });
+-  }
+-
+-  return res.json(doc);
++  const owned = await Document.findById(req.params.id);
++
++  if (!owned || owned.ownerId !== req.user.id) {
++    return res.status(403).json({ error: 'forbidden' });
++  }
++
++  // support ?docId= for the new bulk viewer
++  const target = req.query.docId || req.params.id;
++  const doc = await Document.findById(target);
++
++  return res.json(doc);
+ });
+""",
+    },
+    {
+        "name": "check-then-act across an await",
+        "file": "lib/core/reserveSeat.js",
+        "expect": (
+            "The seat count is read, awaited on, then written. Two concurrent "
+            "calls both read the same count before either writes, so the seat is "
+            "handed to both and capacity is exceeded."
+        ),
+        "signals": [
+            "race", "race condition", "concurrent", "concurrently",
+            "two requests", "both requests", "simultaneous",
+            "check-then-act", "read.*then.*write", "between the read and the write",
+            "stale", "overbook", "oversell", "exceed capacity",
+            "atomic", "not atomic", "transaction", "lock",
+        ],
+        "diff": """--- FILE: lib/core/reserveSeat.js (modified, +14/-3)
+@@ -1,12 +1,23 @@
+ async function reserveSeat(eventId, userId) {
+-  return db.reservations.create({ eventId, userId });
++  const event = await db.events.findById(eventId);
++  const taken = await db.reservations.countFor(eventId);
++
++  if (taken >= event.capacity) {
++    throw new Error('sold out');
++  }
++
++  const reservation = await db.reservations.create({ eventId, userId });
++
++  await db.events.update(eventId, { remaining: event.capacity - taken - 1 });
++
++  return reservation;
+ }
+
+ module.exports = reserveSeat;
+""",
+    },
+]
