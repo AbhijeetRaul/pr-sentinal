@@ -6,3 +6,6 @@ venv/
 *.egg-info/
 .pytest_cache/
 eval/results/
+
+run*.txt
+out.txt
