@@ -12,7 +12,9 @@ Usage:
 """
 import json
 import os
+import re
 import sys
+import time
 from dataclasses import dataclass
 from typing import List
 
@@ -222,6 +224,49 @@ def build_diff_payload(files) -> tuple[str, bool]:
     return "\n".join(chunks), truncated
 
 
+_RETRY_AFTER_RE = re.compile(r"try again in ([\d.]+)(ms|s)", re.IGNORECASE)
+
+
+def call_model(client, **kwargs):
+    """One place where every model call happens, with rate-limit retries.
+
+    Groq enforces a tokens-per-minute ceiling separately from the daily one.
+    A run of this harness fires calls back to back and trips it constantly —
+    and the error is transient: the API literally replies "try again in 345ms".
+    Treating that as a failure was throwing away whole fixtures and, worse,
+    scoring them as "no bugs found".
+
+    Retries respect the delay the API asks for, then fall back to exponential
+    backoff. Only genuinely persistent failures reach the caller.
+    """
+    attempts = 5
+    for attempt in range(attempts):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except Exception as err:  # noqa: BLE001
+            text = str(err)
+            is_rate_limit = "429" in text or "rate_limit" in text.lower()
+            if not is_rate_limit or attempt == attempts - 1:
+                raise
+
+            match = _RETRY_AFTER_RE.search(text)
+            if match:
+                value = float(match.group(1))
+                wait = value / 1000 if match.group(2).lower() == "ms" else value
+                wait += 0.5  # small cushion so we do not arrive exactly on the edge
+            else:
+                wait = 2 ** attempt
+
+            wait = min(wait, 65)
+            console.print(
+                f"[dim]rate limited, waiting {wait:.1f}s "
+                f"(attempt {attempt + 1}/{attempts})[/dim]"
+            )
+            time.sleep(wait)
+
+    raise RuntimeError("unreachable")
+
+
 def critique_comment(
     client, diff_payload: str, extra_context: str, comment: ReviewComment
 ) -> tuple[bool, str]:
@@ -249,7 +294,8 @@ def critique_comment(
     )
 
     try:
-        response = client.chat.completions.create(
+        response = call_model(
+            client,
             model=DEFAULT_MODEL,
             messages=[
                 {"role": "system", "content": CRITIC_SYSTEM_PROMPT},
@@ -306,7 +352,8 @@ def verify_by_execution(
     )
 
     try:
-        response = client.chat.completions.create(
+        response = call_model(
+            client,
             model=DEFAULT_MODEL,
             messages=[
                 {"role": "system", "content": REPRO_SYSTEM_PROMPT},
@@ -365,7 +412,8 @@ def request_review(
     )
 
     try:
-        response = client.chat.completions.create(
+        response = call_model(
+            client,
             model=DEFAULT_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},

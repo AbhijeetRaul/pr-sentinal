@@ -5,8 +5,8 @@ and, more importantly, a set of experiments showing how well it actually works.
 
 Most AI review tools are a wrapper around "send the diff to a model, post
 whatever comes back." This one was built by measuring each addition and keeping
-only what the numbers justified. One planned component was measured and then
-deliberately **not** built.
+only what the numbers justified — including two conclusions that measurement
+later proved wrong, corrected in place below rather than quietly deleted.
 
 ---
 
@@ -31,56 +31,62 @@ post to the PR            dry-run by default
 Tested against diffs with deliberately planted bugs, and against "safe" diffs
 where the correct answer is to say nothing at all.
 
-| Setup | Bugs found | False alarms |
+**Bugs hidden inside a single file — 8 out of 8 found.** Including a broken
+ownership check (any logged-in user could read anyone's documents, via
+`GET /documents/123?docId=456`) and a race condition where two people book the
+last seat at once.
+
+**Bugs that only show up when you look at other files:**
+
+| What the agent could see | Bugs found | False alarms |
 |---|---|---|
-| Just the diff | 3/3 | 4 |
-| \+ related code | 3/3 | 2 |
-| \+ related code + critique | **3/3** | **0** |
-| Critique but no related code | 2/3 | 2 |
+| Just the changed lines | 1/3 | 2 |
+| \+ the exact right file | **3/3** | **1** |
 
-Two things in that table are worth more than the top-line score.
+The agent is nearly blind to this kind of bug on its own. Not because it isn't
+clever enough — because it refuses to guess. Shown only the diff, its critique
+step throws out cross-file claims and explains why: *"the claim depends on
+external callers but no repository context is provided to substantiate that any
+code checks for `err.code === 'ECONNABORTED'`."* That's the correct call. Giving
+it the caller turns a guess into a finding.
 
-**Finding related code did not help the agent find more bugs.** It went 3/3
-either way. What it changed was *false alarms* — warnings about problems that
-weren't real. The agent can guess "some caller might break here" from the diff
-alone, but it can't know whether that guess is true. Showing it the caller
-settles the question, so it stops warning about things that are already fine.
+So the two halves only work as a pair. The critique step demands evidence; the
+search step supplies it. Alone, one makes the agent silent and the other makes
+it noisy.
 
-**The critique pass is not a free improvement.** On its own it made the agent
-*worse* — 3/3 down to 2/3. The critic rejects any claim it can't see evidence
-for, and without related code, some correct findings were lucky guesses with no
-evidence behind them. The two parts only work together: one supplies evidence,
-the other demands it.
+## How the agent finds related code
 
-## The vector database I didn't build
+The usual answer is embeddings and a vector database. Before building that, I
+measured the ceiling: what if the agent is simply handed the perfect file every
+time, with no search step at all? Nothing can beat that, so it bounds what any
+search method could possibly be worth.
 
-The original plan used embeddings and pgvector — the standard approach for
-letting an AI search a codebase. Before building it, I measured the ceiling:
-what happens if the agent is handed the *perfect* file every time, with no
-search step at all?
+Then I built the cheap alternative — symbol lookup, which reads the changed
+function names and string literals out of the diff and finds files that mention
+or import them. No AI, no database, no API cost. Tested against a 13-file
+codebase seeded with deliberately confusing lookalikes.
 
-Perfect context brought false alarms from 4 down to 2. So 2 was the best any
-search method could possibly do.
+| Method | Bugs found | False alarms | Found the right file |
+|---|---|---|---|
+| Nothing | 1/3 | 2 | — |
+| Symbol lookup (free) | 2/3 | 2 | 5 of 6 |
+| Perfect file (the ceiling) | **3/3** | **1** | — |
 
-Then I built the cheap alternative — plain symbol lookup, which just reads the
-changed function names out of the diff and finds files that mention or import
-them. No AI, no database, no API cost.
+Symbol lookup closes most of the gap for nothing, but not all of it. The case it
+misses is the one exact matching structurally cannot reach: a file that never
+imports the changed module and shares a single word with it (`'ECONNABORTED'`),
+while a decoy file shares that word *plus* two others. Ranking by exact matches
+puts the decoy first.
 
-| Method | False alarms | Found the right file |
-|---|---|---|
-| Nothing | 4 | — |
-| Symbol lookup (free) | **2** | 5 of 6 |
-| Perfect context (the ceiling) | **2** | — |
+That is precisely where meaning-based search should win, so the embedding
+comparison now has a real target instead of a foregone conclusion. It is built
+(`src/retrieval.py`) and not yet measured — listed as an open item rather than
+quietly dropped.
 
-Symbol lookup hit the ceiling. A vector database had nothing left to win, so it
-isn't in this project. Postgres and pgvector are still in `docker-compose.yml`
-and the embedding search is implemented in `src/retrieval.py`, because the
-comparison is the point.
-
-The one case symbol lookup missed is the interesting one: a file that never
-imports the changed module and shares exactly one word with it. Exact matching
-structurally cannot find that. It's the one place embeddings might win, and
-it's still unmeasured — noted as an open item rather than quietly ignored.
+An earlier version of this file claimed symbol lookup had matched the ceiling
+exactly, and concluded a vector database was unnecessary. That was measured
+during an undetected API outage. It was wrong, and it is corrected here rather
+than deleted.
 
 ## Things that went wrong (kept in, because they're the useful part)
 
@@ -132,7 +138,9 @@ python -m src.review --selftest-xfile    # bugs needing cross-file context
 python -m src.review --bench-retrieval   # compare search methods
 ```
 
-Add `--no-critique` to any command to measure without the critique pass.
+Flags that work with any command:
+`--no-critique` skips the critique pass, `--verify-exec` runs code in Docker to
+test each claim, `--runs N` repeats a measurement and reports the spread.
 Add `--post` to actually comment on GitHub; without it, nothing is posted.
 
 ## Notes on safety
@@ -149,13 +157,15 @@ is worse than no check, because nothing in the output would tell you.
 
 ## Honest limits
 
-- 3 cross-file test cases, 4 single-file ones. Small.
+- 8 single-file and 3 cross-file test cases. Still small.
 - Test cases are synthetic and written by the same person who tuned the agent.
+  One of them has since been shown to assert safety it does not demonstrate.
 - Embedding search is built but not yet measured.
 - Only tested end-to-end on `axios/axios`.
 - False-alarm rate on real pull requests is based on a single PR.
-- Some figures in [`EVAL.md`](./EVAL.md) were taken during the API outage
-  described above and are marked there as invalid or unconfirmed pending a
-  re-run. They are flagged rather than quietly removed.
+- Single runs, not medians. A difference of 1 should not be over-read.
+- Earlier figures taken during an undetected API outage are marked in
+  [`EVAL.md`](./EVAL.md) as invalid, and the conclusions drawn from them are
+  corrected there.
 
 Full experiment log: [`EVAL.md`](./EVAL.md)
