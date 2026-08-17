@@ -34,7 +34,17 @@ DEFAULT_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 # Cap total diff characters sent to the model. Real PRs can be enormous; this
 # keeps latency and cost predictable and forces you to notice truncation
 # instead of silently reviewing half a PR.
-MAX_DIFF_CHARS = 50_000
+MAX_DIFF_CHARS = 200_000
+
+# Characters per individual request. The free Groq tier allows 8,000 tokens per
+# MINUTE, and roughly 4 characters make a token, so a single request carrying
+# 50k characters of diff (~14k tokens) is rejected outright with a 413 - and a
+# 413 is not transient, so retrying it just wastes time.
+#
+# Real pull requests are therefore reviewed in batches that fit. This is better
+# than truncating anyway: the whole PR gets looked at, and each request is small
+# enough that the model is not skimming twenty files at once.
+MAX_CHARS_PER_REQUEST = int(os.getenv("SENTINAL_CHUNK_CHARS", "11000"))
 
 SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
@@ -211,6 +221,41 @@ class ReviewComment:
     verified: str = ""  # "confirmed" | "refuted" | "inconclusive" | ""
 
 
+def file_block(f) -> str:
+    return f"--- FILE: {f.filename} ({f.status}, +{f.additions}/-{f.deletions})\n{f.patch}\n"
+
+
+def batch_files(files, max_chars: int = MAX_CHARS_PER_REQUEST):
+    """Group changed files into requests that fit the per-minute token ceiling.
+
+    A single file larger than the budget is truncated and flagged rather than
+    silently dropped - reviewing part of a file is useful, pretending you
+    reviewed all of it is not.
+    """
+    batches, current, size = [], [], 0
+
+    for f in files:
+        block = file_block(f)
+
+        if len(block) > max_chars:
+            if current:
+                batches.append(current)
+                current, size = [], 0
+            batches.append([(f, block[:max_chars] + "\n... [file truncated] ...\n")])
+            continue
+
+        if size + len(block) > max_chars and current:
+            batches.append(current)
+            current, size = [], 0
+
+        current.append((f, block))
+        size += len(block)
+
+    if current:
+        batches.append(current)
+    return batches
+
+
 def build_diff_payload(files) -> tuple[str, bool]:
     """Concatenate per-file patches into one prompt payload."""
     chunks, total, truncated = [], 0, False
@@ -245,7 +290,11 @@ def call_model(client, **kwargs):
             return client.chat.completions.create(**kwargs)
         except Exception as err:  # noqa: BLE001
             text = str(err)
-            is_rate_limit = "429" in text or "rate_limit" in text.lower()
+            # 413 means the request itself is too big. Retrying an oversized
+            # request just fails again more slowly - it needs to be split, not
+            # repeated. Only a 429 (too often) is worth waiting out.
+            too_large = "413" in text or "too large" in text.lower()
+            is_rate_limit = ("429" in text or "rate_limit" in text.lower()) and not too_large
             if not is_rate_limit or attempt == attempts - 1:
                 raise
 
@@ -980,14 +1029,38 @@ def main() -> None:
         console.print("\n[yellow]Nothing reviewable in this PR.[/yellow]")
         return
 
-    diff_payload, truncated = build_diff_payload(reviewable)
-    if truncated:
+    batches = batch_files(reviewable)
+    if len(batches) > 1:
         console.print(
-            f"\n[yellow]Diff exceeded {MAX_DIFF_CHARS} chars — reviewing a prefix only.[/yellow]"
+            f"\n[dim]diff split into {len(batches)} request(s) to fit the "
+            f"per-minute token limit[/dim]"
         )
 
-    console.print(f"\n[dim]Calling {DEFAULT_MODEL}...[/dim]\n")
-    comments = request_review(ctx, diff_payload)
+    comments = []
+    for i, batch in enumerate(batches, 1):
+        if len(batches) > 1:
+            console.print(
+                f"[dim]  batch {i}/{len(batches)}: "
+                f"{', '.join(f.filename for f, _ in batch)}[/dim]"
+            )
+        payload = "\n".join(block for _, block in batch)
+        comments.extend(request_review(ctx, payload))
+
+    comments.sort(key=lambda c: SEVERITY_ORDER.get(c.severity, 9))
+
+    if MODEL_FAILURES:
+        console.print(
+            Panel(
+                f"{MODEL_FAILURES} model call(s) failed while reviewing this PR.\n"
+                "Part of the diff was never actually read, so 'no issues found' "
+                "would be a lie.\n\n"
+                "[bold]Refusing to post.[/bold] Read the red error(s) above.",
+                title="[red]REVIEW INCOMPLETE[/red]",
+            )
+        )
+        for c in comments:
+            console.print(f"  [{c.severity}/{c.category}] {escape(c.comment)}")
+        sys.exit(2)
 
     if not comments:
         console.print("[green]No issues found.[/green]")

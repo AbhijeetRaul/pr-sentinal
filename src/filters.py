@@ -25,6 +25,13 @@ SKIP_FILENAMES = {
 SKIP_PATH_PATTERNS = [
     re.compile(p)
     for p in (
+        # Prose. A code reviewer has nothing useful to say about a changelog,
+        # and on one real PR these files consumed a whole request batch - about
+        # 11% of a daily token budget spent reviewing markdown.
+        r"\.(md|mdx|rst|txt)$",
+        r"(^|/)docs?/",
+        r"(^|/)\.github/",
+        r"(^|/)CHANGELOG",
         r"(^|/)node_modules/",
         r"(^|/)vendor/",
         r"(^|/)dist/",
@@ -44,12 +51,18 @@ SKIP_PATH_PATTERNS = [
 MAX_PATCH_LINES = 400
 
 
+DOC_RE = re.compile(r"\.(md|mdx|rst|txt)$|(^|/)docs?/|(^|/)\.github/|(^|/)CHANGELOG")
+
+
 def should_review(filename: str) -> Tuple[bool, str]:
     """Return (keep, reason_if_skipped)."""
     basename = filename.rsplit("/", 1)[-1]
 
     if basename in SKIP_FILENAMES:
         return False, "dependency lockfile"
+
+    if DOC_RE.search(filename):
+        return False, "documentation / prose"
 
     for pattern in SKIP_PATH_PATTERNS:
         if pattern.search(filename):

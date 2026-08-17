@@ -60,6 +60,61 @@ Promise, breaking `pollJob(id).then(...)`. That bug was accidental and unnoticed
 | symbol (lexical) | 2/3 | 2 | 5/6 |
 | oracle (perfect context) | **3/3** | **1** | — |
 
+### Real pull requests (axios/axios, no retrieval — diff only)
+
+The first test on code neither the author nor the agent wrote. Note the real-PR
+path runs **without** retrieval, which today's cross-file result predicts will
+cost detection; it is still the right test for false alarms.
+
+| PR | outcome |
+|---|---|
+| #11118 fix(interceptors) | complete, **0 comments** |
+| #11121 fix(xhr) progress | complete, **0 comments** |
+| #11141 fix: harden runtime option handling | incomplete (1 failed call), 1 substantive finding — see below |
+| #11109, #11096 | incomplete, refused to report |
+
+**2 complete reviews, 0 false alarms.** A small but real number: these PRs were
+reviewed and merged by axios maintainers, so silence is the correct answer.
+
+The finding on #11141, which survived the critic:
+
+> `toSafeFlatObject` copies property values using `thing[prop]` instead of
+> `current[prop]`; if a prototype defines an accessor that throws or has side
+> effects when accessed via the derived object, this will throw or execute
+> unintended code.
+
+That is a claim that a *prototype-pollution hardening* PR has a hole in the
+hardening. Pending manual verification against the source.
+
+The critic was visibly working on real code too, rejecting one claim with:
+*"the diff shows the Object.prototype modifications are deleted in finally
+blocks, so the claim of leaking into other tests is false."*
+
+### Two problems real PRs exposed that fixtures never could
+
+**Requests were too large.** The free tier allows 8,000 tokens per minute; the
+code packed up to 50,000 characters (~14k tokens) into one call, so every
+substantial PR returned 413 — and 413 is not transient, so retrying wasted time.
+Diffs are now reviewed in ~11,000-character batches. Better than the old
+truncation, which silently reviewed a prefix.
+
+**The product path had the same silent-failure bug as the harness.** On the
+first attempt, four of five PRs failed to be read and the agent announced "no
+issues found" for every one, printing the comment it would have posted. The
+MEASUREMENT INVALID guard had been added to the *test* code and not to the code
+that talks to GitHub — the wrong way round, since only one of those can post a
+false review in public. Now: REVIEW INCOMPLETE, refuse to post, non-zero exit.
+
+**Batching fragments context.** The critic rejected a claim as relying on
+`fromDataURI.js` "not shown" — but that file *was* in the PR, in batch 4, while
+the code referencing it was in batch 8. Splitting to fit the token limit creates
+a new blind spot. Unsolved; grouping related files into the same batch is the
+obvious next step.
+
+**Documentation was being reviewed.** One batch of nine was `AGENTS.md`,
+`copilot-instructions.md` and a changelog — roughly 11% of a daily token budget
+spent reviewing prose. Now filtered.
+
 ---
 
 ## Corrections to earlier claims
