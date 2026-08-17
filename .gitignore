@@ -9,3 +9,5 @@ eval/results/
 
 run*.txt
 out.txt
+
+.cache/

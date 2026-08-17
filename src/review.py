@@ -44,7 +44,12 @@ MAX_DIFF_CHARS = 200_000
 # Real pull requests are therefore reviewed in batches that fit. This is better
 # than truncating anyway: the whole PR gets looked at, and each request is small
 # enough that the model is not skimming twenty files at once.
-MAX_CHARS_PER_REQUEST = int(os.getenv("SENTINAL_CHUNK_CHARS", "11000"))
+MAX_CHARS_PER_REQUEST = int(os.getenv("SENTINAL_CHUNK_CHARS", "7000"))
+
+# Retrieved context shares the same per-minute ceiling as the diff, so it gets
+# its own budget rather than being allowed to crowd out the code under review.
+# 7k diff + 4k context is ~3k tokens, comfortably under an 8k/minute limit.
+MAX_CONTEXT_CHARS = int(os.getenv("SENTINAL_CONTEXT_CHARS", "4000"))
 
 SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
@@ -954,6 +959,40 @@ def run_retrieval_bench(skip_embed: bool = False) -> None:
     )
 
 
+def build_repo_context(ctx, reviewable):
+    """Clone the repo once and prepare symbol retrieval over it.
+
+    Retrieval was measured in the benchmarks and never wired into the path that
+    reviews actual pull requests - so the measured improvement (1/3 -> 3/3 on
+    cross-file bugs) applied to nothing a user would ever run. This connects it.
+
+    Every failure here is non-fatal: no git, no network, a private repo, a huge
+    monorepo that times out. The review continues without context, exactly as
+    before, with one dim line saying so.
+    """
+    try:
+        from src.repo_cache import ensure_repo, load_corpus
+        from src.retrieval import SymbolRetriever
+    except ImportError:
+        return None, None
+
+    root = ensure_repo(ctx.owner, ctx.repo)
+    if root is None:
+        console.print(
+            "[dim]no repo clone available - reviewing the diff alone "
+            "(needs git and network access)[/dim]"
+        )
+        return None, None
+
+    changed = {f.filename for f in reviewable}
+    corpus = load_corpus(root, exclude=changed)
+    if not corpus:
+        return None, None
+
+    console.print(f"[dim]searching {len(corpus)} files for related code[/dim]")
+    return SymbolRetriever(), corpus
+
+
 def main() -> None:
     global CRITIQUE_ENABLED, VERIFY_EXEC
 
@@ -1029,6 +1068,8 @@ def main() -> None:
         console.print("\n[yellow]Nothing reviewable in this PR.[/yellow]")
         return
 
+    retriever, corpus = build_repo_context(ctx, reviewable)
+
     batches = batch_files(reviewable)
     if len(batches) > 1:
         console.print(
@@ -1044,7 +1085,24 @@ def main() -> None:
                 f"{', '.join(f.filename for f, _ in batch)}[/dim]"
             )
         payload = "\n".join(block for _, block in batch)
-        comments.extend(request_review(ctx, payload))
+
+        extra = ""
+        if retriever and corpus:
+            from src.retrieval import format_context
+
+            found = retriever.retrieve(payload, corpus, k=2)
+            if found:
+                extra = format_context(
+                    [
+                        {"path": f["path"], "content": f["content"][:MAX_CONTEXT_CHARS // 2]}
+                        for f in found
+                    ]
+                )[:MAX_CONTEXT_CHARS]
+                console.print(
+                    f"[dim]    context: {', '.join(f['path'] for f in found)}[/dim]"
+                )
+
+        comments.extend(request_review(ctx, payload, extra_context=extra))
 
     comments.sort(key=lambda c: SEVERITY_ORDER.get(c.severity, 9))
 
