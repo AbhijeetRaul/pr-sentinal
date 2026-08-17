@@ -88,6 +88,42 @@ exactly, and concluded a vector database was unnecessary. That was measured
 during an undetected API outage. It was wrong, and it is corrected here rather
 than deleted.
 
+## On real pull requests
+
+Everything above uses bugs I planted. The harder test is code neither I nor the
+agent has seen. Five merged pull requests from `axios/axios`, reviewed by
+maintainers before merging, so silence is usually the right answer:
+
+- **2 reviewed completely, 0 false alarms.**
+- 3 hit API limits mid-review. The agent refused to report on those rather than
+  claiming a clean bill of health.
+- 1 substantive finding, examined by hand below.
+
+### The finding, and why it is only half right
+
+On a pull request hardening axios against prototype pollution, the agent flagged
+that `toSafeFlatObject` builds its property list from one object and reads the
+values from another:
+
+```js
+const props = Object.getOwnPropertyNames(current);  // names from current
+result[prop] = thing[prop];                         // value from thing
+```
+
+That inconsistency is real — I checked the source. But its explanation was
+wrong. It warned about getters that throw or have side effects and proposed
+reading `current[prop]` instead, which runs the getter just the same; it only
+changes what `this` points at. For ordinary properties the two are identical.
+
+The issue worth raising is one neither the code nor the agent reached: a
+function hardening against prototype pollution runs arbitrary getters just by
+using `[]` access. Reading through `Object.getOwnPropertyDescriptor` would copy
+or skip accessors without executing attacker-controlled code.
+
+So: correct reading, wrong reasoning, unusable fix. It was not posted. That is
+the honest measure of what an AI reviewer is worth right now — good enough to
+point a human at the right line, not good enough to be trusted unsupervised.
+
 ## Things that went wrong (kept in, because they're the useful part)
 
 **The first version found nothing and reported three problems.** All three were

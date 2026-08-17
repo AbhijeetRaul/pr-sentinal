@@ -83,8 +83,37 @@ The finding on #11141, which survived the critic:
 > effects when accessed via the derived object, this will throw or execute
 > unintended code.
 
-That is a claim that a *prototype-pollution hardening* PR has a hole in the
-hardening. Pending manual verification against the source.
+**Verified against the source. Verdict: real observation, wrong diagnosis.**
+
+The code does do this:
+
+```js
+const props = Object.getOwnPropertyNames(current);  // names from current
+...
+result[prop] = thing[prop];                         // value from thing
+```
+
+Enumerating one object and reading from another is a genuine inconsistency and
+fair to flag. But the agent's reasoning does not hold up:
+
+- For plain data properties there is no difference — `thing[prop]` resolves up
+  the prototype chain to the same value.
+- For accessors it does differ, but only in the receiver: `thing[prop]` runs the
+  getter with `this === thing`, `current[prop]` with `this === current`.
+- **The proposed fix does not prevent what it claims to.** The agent warned about
+  getters that throw or have side effects and suggested `current[prop]` — which
+  invokes the getter just the same.
+
+The sharper finding, which neither the code nor the agent reached: a function
+hardening against prototype pollution executes arbitrary getters simply by using
+`[]` access. `Object.getOwnPropertyDescriptor` would let it copy or skip
+accessors without running attacker-controlled code.
+
+Recorded as a **partial hit**: correct reading of the code, incorrect reasoning
+about consequences, unusable fix. Not posted to the PR — the comment as written
+would be wrong. This is the most useful single data point in the file, because
+it shows what "the agent found something" is actually worth without a human
+checking it.
 
 The critic was visibly working on real code too, rejecting one claim with:
 *"the diff shows the Object.prototype modifications are deleted in finally
